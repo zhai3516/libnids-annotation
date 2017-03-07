@@ -5,6 +5,9 @@
  Add document by Zhaif <zhai3516@163.com> at 2017/03/01
  */
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #include <config.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -85,9 +88,11 @@ static struct ip *ugly_iphdr;
  */
 struct tcp_timeout *nids_tcp_timeouts = 0;
 
-
-// 清空传入的 half_stream 的 list
-// TODO : list 中存储的是什么？
+/*
+ 清空传入的 half_stream 的 list
+ list 中存储的是从 tcp 报文中捕获的原始报文
+ listtail 中存储的是 list 的表尾元素
+*/
 static void purge_queue(struct half_stream * h)
 {
     struct skbuff *tmp, *p = h->list;
@@ -250,7 +255,7 @@ mk_hash_index(struct tuple4 addr)
 }
 
 
-// 从tcp 报文中获取 sth ？ TODO: ts 是什么？
+// 从tcp 报文中获取 timestamp
 static int get_ts(struct tcphdr * this_tcphdr, unsigned int * ts)
 {
     int len = 4 * this_tcphdr->th_off;
@@ -631,7 +636,8 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
             }
         }
     }
-    // 如果 client 端状态为 FIN_SENT，则将 tcp_stream 移动到超市双链表中
+    
+    // 如果 数据包状态为 FIN_SENT，则将snd state 置为 FIN_SENT，并将 a_tcp 移动到将双链表中
     // 注意： 这里没有做关闭连接的处理，例如从 hash_table 中移除这样的操作
     if (fin) {
         snd->state = FIN_SENT;
@@ -732,6 +738,7 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
          * for retransmissions which will never happen.  -- Sebastien Raveau
          */
         if (pakiet->fin) {
+            // 收到 client 的 close 请求
             snd->state = TCP_CLOSING;
             if (rcv->state == FIN_SENT || rcv->state == FIN_CONFIRMED)
                 add_tcp_closing_timeout(a_tcp);
@@ -767,6 +774,12 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
     }
 }
 
+/*
+ 这个函数同之前 purge_queue 作用相同
+ 唯一区别在于，其多接受一个指向tcp报文头部的指针 tcphdr，
+ 并会输出一条告警『NIDS_WARN_TCP_BIGQUEUE』
+ 在 rmem_alloc > 65535 是触发
+ */
 static void
 prune_queue(struct half_stream * rcv, struct tcphdr * this_tcphdr)
 {
@@ -783,6 +796,9 @@ prune_queue(struct half_stream * rcv, struct tcphdr * this_tcphdr)
     rcv->rmem_alloc = 0;
 }
 
+/*
+ 根据传入的确认序号 acknum，更改发送方半连接 snd 的 ack_seq 标记
+ */
 static void
 handle_ack(struct half_stream * snd, u_int acknum)
 {
@@ -793,6 +809,10 @@ handle_ack(struct half_stream * snd, u_int acknum)
         snd->ack_seq = acknum;
     }
 }
+
+/*
+ TODO : 检查tcp报文的flag？
+ */
 #if 0
 static void
 check_flags(struct ip * iph, struct tcphdr * th)
@@ -804,6 +824,9 @@ check_flags(struct ip * iph, struct tcphdr * th)
 }
 #endif
 
+/*
+ 这个函数会分别从输出的ip报文的 src->dst ，和 src<-dst 两个方向查找 tcp_stream
+ */
 struct tcp_stream *
 find_stream(struct tcphdr * this_tcphdr, struct ip * this_iphdr,
             int *from_client)
@@ -811,27 +834,39 @@ find_stream(struct tcphdr * this_tcphdr, struct ip * this_iphdr,
     struct tuple4 this_addr, reversed;
     struct tcp_stream *a_tcp;
     
+    // 从 tcp header 获取 src port, dst port
+    // 从 ip header 获取 src host, dst host
     this_addr.source = ntohs(this_tcphdr->th_sport);
     this_addr.dest = ntohs(this_tcphdr->th_dport);
     this_addr.saddr = this_iphdr->ip_src.s_addr;
     this_addr.daddr = this_iphdr->ip_dst.s_addr;
+    
+    // 从 src->dst 方向查找
     a_tcp = nids_find_tcp_stream(&this_addr);
     if (a_tcp) {
         *from_client = 1;
         return a_tcp;
     }
+    
     reversed.source = ntohs(this_tcphdr->th_dport);
     reversed.dest = ntohs(this_tcphdr->th_sport);
     reversed.saddr = this_iphdr->ip_dst.s_addr;
     reversed.daddr = this_iphdr->ip_src.s_addr;
+    
+    // 从 dst->src 方向查找
     a_tcp = nids_find_tcp_stream(&reversed);
     if (a_tcp) {
         *from_client = 0;
         return a_tcp;
     }
+    
+    // 未找到返回0
     return 0;
 }
 
+/*
+ 根据 src 和 dst 的地址信息，从 hash table中找到指定的 tcp_stream
+ */
 struct tcp_stream *
 nids_find_tcp_stream(struct tuple4 *addr)
 {
@@ -846,6 +881,10 @@ nids_find_tcp_stream(struct tuple4 *addr)
 }
 
 
+/*
+ 清空并释放tcp_stream_table_size 并释放其中的所有 tcp_stream 链接
+ 注意：释放前触发所有监听者的 NIDS_EXITING 处理
+ */
 void tcp_exit(void)
 {
     int i;
@@ -859,6 +898,7 @@ void tcp_exit(void)
         while(a_tcp) {
             t_tcp = a_tcp;
             a_tcp = a_tcp->next_node;
+            // 释放前会依次像所有监听者发送 NIDS_EXITING，即依次触发所有callback 函数的 NIDS_EXITING 处理
             for (j = t_tcp->listeners; j; j = j->next) {
                 t_tcp->nids_state = NIDS_EXITING;
                 (j->item)(t_tcp, &j->data);
@@ -876,11 +916,19 @@ void tcp_exit(void)
     tcp_num = 0;
 }
 
+/*
+ 这个函数是处理 tcp 报文的核心函数，当 libnids 从 pcap 捕获到数据链路层的数据包中过滤出 ip数据包时
+ 根据 ip 头解析出这个数据包包含的传输控制层协议，如果是 tcp 协议，则会触发这个处理函数
+ 这个处理函数会依次判断这个 tcp 报文 是否是第一次握手、第二次握手、第三次握手、第四次握手
+ */
 void
 process_tcp(u_char * data, int skblen)
 {
+    // ip 头指针
     struct ip *this_iphdr = (struct ip *)data;
+    // tcp 头指针
     struct tcphdr *this_tcphdr = (struct tcphdr *)(data + 4 * this_iphdr->ip_hl);
+    
     int datalen, iplen;
     int from_client = 1;
     unsigned int tmp_ts;
@@ -889,12 +937,14 @@ process_tcp(u_char * data, int skblen)
     
     ugly_iphdr = this_iphdr;
     iplen = ntohs(this_iphdr->ip_len);
+    // 验证报文是否有效： （ip报文长度 > ip头长度 + tcp头长度） 为真，否则说明不完整，缺少 tcp 头的信息
     if ((unsigned)iplen < 4 * this_iphdr->ip_hl + sizeof(struct tcphdr)) {
         nids_params.syslog(NIDS_WARN_TCP, NIDS_WARN_TCP_HDR, this_iphdr,
                            this_tcphdr);
         return;
     } // ktos sie bawi
     
+    // 计算tcp报文数据部分的其实地址： 原始data地址 - ip头长度 - tcp头长度 = tcp数据部分起始地址
     datalen = iplen - 4 * this_iphdr->ip_hl - 4 * this_tcphdr->th_off;
     
     if (datalen < 0) {
@@ -903,31 +953,48 @@ process_tcp(u_char * data, int skblen)
         return;
     } // ktos sie bawi
     
+    // 验证 ip头中 src 和 dst 主机地址
     if ((this_iphdr->ip_src.s_addr | this_iphdr->ip_dst.s_addr) == 0) {
         nids_params.syslog(NIDS_WARN_TCP, NIDS_WARN_TCP_HDR, this_iphdr,
                            this_tcphdr);
         return;
     }
+    
+    // 判断是否需要扫描有攻击
     if (!(this_tcphdr->th_flags & TH_ACK))
         detect_scan(this_iphdr);
+    
+    
     if (!nids_params.n_tcp_streams) return;
+    
+    // 检测 tcp ；TODO : 确认检测哪些内容，检测方法。
     if (my_tcp_check(this_tcphdr, iplen - 4 * this_iphdr->ip_hl,
                      this_iphdr->ip_src.s_addr, this_iphdr->ip_dst.s_addr)) {
         nids_params.syslog(NIDS_WARN_TCP, NIDS_WARN_TCP_HDR, this_iphdr,
                            this_tcphdr);
         return;
     }
+    
+    // 检测 flag
 #if 0
     check_flags(this_iphdr, this_tcphdr);
     //ECN
 #endif
+    
+    // 检测是否为第一次握手的数据包
+    // 判断 hash table 中是否有这个 tcp 包的记录
     if (!(a_tcp = find_stream(this_tcphdr, this_iphdr, &from_client))) {
         if ((this_tcphdr->th_flags & TH_SYN) &&
             !(this_tcphdr->th_flags & TH_ACK) &&
             !(this_tcphdr->th_flags & TH_RST))
+            // 确定是第一次握手，会触发 add_new_tcp 操作
             add_new_tcp(this_tcphdr, this_iphdr);
+        // 不是第一次握手且hash table中无记录，则直接被释放
         return;
     }
+    // 以上部分是确认是否是第一次握手
+    
+    // 根据 hash table 查找结果，初始化 snd、rcv 两个半连接
     if (from_client) {
         snd = &a_tcp->client;
         rcv = &a_tcp->server;
@@ -936,12 +1003,25 @@ process_tcp(u_char * data, int skblen)
         rcv = &a_tcp->client;
         snd = &a_tcp->server;
     }
+    
+    // 检测是否为第二次握手的数据包
     if ((this_tcphdr->th_flags & TH_SYN)) {
+        // 如果是第二次握手, 此时：
+        // a_tcp 的 client 应该是发出第一次握手后的状态：client.state == TCP_SYN_SENT
+        // a_tcp 的 server 也仍是第一次握手后的状态(还未来得及更改，待这次握手处理后才会更新) ：a_tcp->server.state == TCP_CLOSE
+        // 这个 tcp 报文的头部 flag 应该是 TH_ACK， 标示这是一个 ack 报文
+        // 不满足这些条件则说明不是第二次握手
         if (from_client || a_tcp->client.state != TCP_SYN_SENT ||
             a_tcp->server.state != TCP_CLOSE || !(this_tcphdr->th_flags & TH_ACK))
             return;
+        
+        // 判断这个报文的 ack seq 是否与 a_tcp 的 client seq 对应，
+        // 如果不对应，说明不是同一个连接
         if (a_tcp->client.seq != ntohl(this_tcphdr->th_ack))
             return;
+        
+        // 此时，可以确实是当前 a_tcp 的第二次握手数据包
+        // 更新 a_tcp 的相关数据
         a_tcp->server.state = TCP_SYN_RECV;
         a_tcp->server.seq = ntohl(this_tcphdr->th_seq) + 1;
         a_tcp->server.first_data_seq = a_tcp->server.seq;
@@ -965,19 +1045,25 @@ process_tcp(u_char * data, int skblen)
         }
         return;
     }
+    
+    // 以上部分是确认是否是第二次握手
+    
+    // 如果数据包不是第三次握手，且不是当前连接期望的数据窗口内
     if (
-        ! (  !datalen && ntohl(this_tcphdr->th_seq) == rcv->ack_seq  )
+        ! (  !datalen && ntohl(this_tcphdr->th_seq) == rcv->ack_seq  ) // 括号内的部分确认是否是第三次握手
         &&
-        ( !before(ntohl(this_tcphdr->th_seq), rcv->ack_seq + rcv->window*rcv->wscale) ||
+        ( !before(ntohl(this_tcphdr->th_seq), rcv->ack_seq + rcv->window*rcv->wscale) || // 确认数据包是否落在 rcv 期望的窗口内
          before(ntohl(this_tcphdr->th_seq) + datalen, rcv->ack_seq)
          )
         )
         return;
     
+    // 处理 reset 的数据包
     if ((this_tcphdr->th_flags & TH_RST)) {
-        if (a_tcp->nids_state == NIDS_DATA) {
+        if (a_tcp->nids_state == NIDS_DATA) { // RESET 发生在数据传输阶段
             struct lurker_node *i;
             
+            // 依次触发监听者的 NIDS_RESET 相应处理
             a_tcp->nids_state = NIDS_RESET;
             for (i = a_tcp->listeners; i; i = i->next)
                 (i->item) (a_tcp, &i->data);
@@ -986,15 +1072,22 @@ process_tcp(u_char * data, int skblen)
         return;
     }
     
-    /* PAWS check */
+    
+    /* PAWS（protection against wrapped sequence numbers） check */
     if (rcv->ts_on && get_ts(this_tcphdr, &tmp_ts) &&
         before(tmp_ts, snd->curr_ts))
         return;
     
+    // 判断是否第三次握手
     if ((this_tcphdr->th_flags & TH_ACK)) {
+        // 如果是第三次握手，此时：
+        // a_tcp 的 client、server 都是发送第二次握手后的状态：TCP_SYN_SENT, TCP_SYN_RECV
         if (from_client && a_tcp->client.state == TCP_SYN_SENT &&
             a_tcp->server.state == TCP_SYN_RECV) {
+            // 根据 ack_seq 确定是否是当前连接 a_tcp 所对应的握手信号
+            // 如果是，则说明连接建立
             if (ntohl(this_tcphdr->th_ack) == a_tcp->server.seq) {
+                // 更改第三次握手后 a_tcp 的相关状态
                 a_tcp->client.state = TCP_ESTABLISHED;
                 a_tcp->client.ack_seq = ntohl(this_tcphdr->th_ack);
                 {
@@ -1002,16 +1095,25 @@ process_tcp(u_char * data, int skblen)
                     struct lurker_node *j;
                     void *data;
                     
+                    
                     a_tcp->server.state = TCP_ESTABLISHED;
                     a_tcp->nids_state = NIDS_JUST_EST;
+                    
+                    // 此时会触发libnids中注册的所有 tcp 回调函数（注意，触发的是 NIDS_JUST_EST 的处理部分）
                     for (i = tcp_procs; i; i = i->next) {
-                        char whatto = 0;
+                        char whatto = 0; // 标示 回调函数做了什么
+                        
+                        // 提起记录 a_tcp 的原始值，用以和回调函数处理后 a_tcp 的这些值比较，确定发生了那些变动
                         char cc = a_tcp->client.collect;
                         char sc = a_tcp->server.collect;
                         char ccu = a_tcp->client.collect_urg;
                         char scu = a_tcp->server.collect_urg;
                         
+                        // 调用回调函数
                         (i->item) (a_tcp, &data);
+                        
+                        // 调用回调函数后，比较上述原始值和更新后的值，并标记发生了那些变动
+                        // 从而确定这个回调函数关注哪些数据，因为可能并不是所有的回调函数都关心tcp连接的数据，可能只关心建联信息
                         if (cc < a_tcp->client.collect)
                             whatto |= COLLECT_cc;
                         if (ccu < a_tcp->client.collect_urg)
@@ -1030,6 +1132,8 @@ process_tcp(u_char * data, int skblen)
                                 whatto&=~COLLECT_sc;
                             }
                         }
+                        
+                        // 根据用户的处理，确认这个连接 a_tcp 后续的数据传输的数据包有那些监听者
                         if (whatto) {
                             j = mknew(struct lurker_node);
                             j->item = i->item;
@@ -1039,23 +1143,36 @@ process_tcp(u_char * data, int skblen)
                             a_tcp->listeners = j;
                         }
                     }
+                    
+                    // 如果没有监听者，说明不关心后续数据，直接释放即可
+
                     if (!a_tcp->listeners) {
                         nids_free_tcp_stream(a_tcp);
                         return;
                     }
+                    
+                    // 当所有的监听者执行完 NIDS_JUST_EST 的处理后
+                    // 把 nids_state 设为 NIDS_DATA， 等待后续数据到来会触发相应回调函数
                     a_tcp->nids_state = NIDS_DATA;
                 }
             }
-            // return;
+            // return;  与第一次、第二次握手不同，这里不会return
         }
     }
+    // 以上是第三次握手的处理部分
+    // 注意，与第一次、第二次握手不同的是，正常第三次握手处理完后不会return
+    // 因为第三次可能包含数据，所以会继续往下走
+    
+    
+    // 此时开始判断是否是第四次握手
     if ((this_tcphdr->th_flags & TH_ACK)) {
         handle_ack(snd, ntohl(this_tcphdr->th_ack));
         if (rcv->state == FIN_SENT)
             rcv->state = FIN_CONFIRMED;
         if (rcv->state == FIN_CONFIRMED && snd->state == FIN_CONFIRMED) {
-            struct lurker_node *i;
             
+            // 完成第四次握手后，触发监听者的 close 处理
+            struct lurker_node *i;
             a_tcp->nids_state = NIDS_CLOSE;
             for (i = a_tcp->listeners; i; i = i->next)
                 (i->item) (a_tcp, &i->data);
@@ -1063,11 +1180,14 @@ process_tcp(u_char * data, int skblen)
             return;
         }
     }
+    
+    // 此时，tcp报文是否包含数据部分并处理
     if (datalen + (this_tcphdr->th_flags & TH_FIN) > 0)
         tcp_queue(a_tcp, this_tcphdr, snd, rcv,
                   (char *) (this_tcphdr) + 4 * this_tcphdr->th_off,
                   datalen, skblen);
-    snd->window = ntohs(this_tcphdr->th_win);
+    snd->window = ntohs(this_tcphdr->th_win);// 更新发送窗口
+    
     if (rcv->rmem_alloc > 65535)
         prune_queue(rcv, this_tcphdr);
     if (!a_tcp->listeners)
@@ -1081,18 +1201,28 @@ nids_discard(struct tcp_stream * a_tcp, int num)
         a_tcp->read = num;
 }
 
+/* 
+ 注册 tcp 监听回调函数
+*/
 void
 nids_register_tcp(void (*x))
 {
     register_callback(&tcp_procs, x);
 }
 
+/*
+ 反注册 tcp 监听回调函数
+*/
 void
 nids_unregister_tcp(void (*x))
 {
     unregister_callback(&tcp_procs, x);
 }
 
+/* 
+ 初始化操作，包括：
+ tcp_stream_table_size，max_stream，streams_pool，free_streams，nids_tcp_timeouts
+*/
 int
 tcp_init(int size)
 {
@@ -1143,6 +1273,9 @@ tcp_init(int size)
 #endif
 
 
+/*
+ 处理 icmp 报文
+ */
 void
 process_icmp(u_char * data)
 {
@@ -1205,4 +1338,3 @@ process_icmp(u_char * data)
         (i->item) (a_tcp, &i->data);
     nids_free_tcp_stream(a_tcp);
 }
-
